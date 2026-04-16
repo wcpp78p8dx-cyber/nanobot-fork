@@ -1388,6 +1388,8 @@ def _register_login(name: str):
 @provider_app.command("login")
 def provider_login(
     provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    profile: str = typer.Option("default", "--profile", "-p", help="OAuth profile name for account pools"),
+    force: bool = typer.Option(False, "--force", help="Run the OAuth flow even if a token exists"),
 ):
     """Authenticate with an OAuth provider."""
     from nanobot.providers.registry import PROVIDERS
@@ -1405,31 +1407,38 @@ def provider_login(
         raise typer.Exit(1)
 
     console.print(f"{__logo__} OAuth Login - {spec.label}\n")
-    handler()
+    if spec.name == "openai_codex":
+        handler(profile=profile, force=force)
+    else:
+        handler()
 
 
 @_register_login("openai_codex")
-def _login_openai_codex() -> None:
+def _login_openai_codex(profile: str = "default", force: bool = False) -> None:
     try:
-        from oauth_cli_kit import get_token, login_oauth_interactive
+        from nanobot.providers.codex_accounts import (
+            get_codex_account_pool_path,
+            login_codex_account,
+        )
 
-        token = None
-        try:
-            token = get_token()
-        except Exception:
-            pass
-        if not (token and token.access):
+        if force:
             console.print("[cyan]Starting interactive OAuth login...[/cyan]\n")
-            token = login_oauth_interactive(
-                print_fn=lambda s: console.print(s),
-                prompt_fn=lambda s: typer.prompt(s),
-            )
-        if not (token and token.access):
-            console.print("[red]✗ Authentication failed[/red]")
-            raise typer.Exit(1)
-        console.print(f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]")
+        account = login_codex_account(
+            profile_id=profile,
+            force=force,
+            print_fn=lambda s: console.print(s),
+            prompt_fn=lambda s: typer.prompt(s),
+        )
+        console.print(
+            f"[green]✓ Authenticated with OpenAI Codex[/green]  "
+            f"[dim]profile={account.profile_id} account={account.token.account_id}[/dim]"
+        )
+        console.print(f"[dim]Saved to {get_codex_account_pool_path()}[/dim]")
     except ImportError:
         console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
 
 

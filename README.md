@@ -1,3 +1,5 @@
+> Personal fork notes: see [PERSONAL_NOTES.md](./PERSONAL_NOTES.md).
+
 <div align="center">
   <img src="nanobot_logo.png" alt="nanobot" width="500">
   <h1>nanobot: Ultra-Lightweight Personal AI Agent</h1>
