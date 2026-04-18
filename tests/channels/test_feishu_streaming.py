@@ -257,6 +257,30 @@ class TestSendDelta:
         await ch.send_delta("oc_chat1", "c")
         assert buf.sequence == 7
 
+    @pytest.mark.asyncio
+    async def test_group_topic_streams_use_separate_buffers(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.side_effect = [
+            _mock_create_card_response("card_a"),
+            _mock_create_card_response("card_b"),
+        ]
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_new")
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta(
+            "oc_chat1",
+            "Topic A",
+            metadata={"thread_id": "omt_a", "root_id": "om_a"},
+        )
+        await ch.send_delta(
+            "oc_chat1",
+            "Topic B",
+            metadata={"thread_id": "omt_b", "root_id": "om_b"},
+        )
+
+        assert ch._stream_bufs["oc_chat1:thread:omt_a"].text == "Topic A"
+        assert ch._stream_bufs["oc_chat1:thread:omt_b"].text == "Topic B"
+
 
 class TestToolHintInlineStreaming:
     """Tool hint messages should be inlined into active streaming cards."""
@@ -380,6 +404,27 @@ class TestToolHintInlineStreaming:
         assert buf.text == "Partial answer"
         assert buf.sequence == 2
         ch._client.cardkit.v1.card_element.content.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tool_hint_uses_topic_stream_buffer(self):
+        """Tool hints should append to the active topic card, not the whole group."""
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1:thread:omt_topic"] = _FeishuStreamBuf(
+            text="Partial topic answer", card_id="card_1", sequence=2, last_edit=0.0,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        msg = OutboundMessage(
+            channel="feishu",
+            chat_id="oc_chat1",
+            content="$ git status",
+            metadata={"_tool_hint": True, "thread_id": "omt_topic", "root_id": "om_root"},
+        )
+        await ch.send(msg)
+
+        buf = ch._stream_bufs["oc_chat1:thread:omt_topic"]
+        assert "🔧 $ git status" in buf.text
+        ch._client.im.v1.message.create.assert_not_called()
 
 
 class TestSendMessageReturnsId:

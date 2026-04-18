@@ -51,6 +51,7 @@ def _make_feishu_event(
     sender_open_id: str = "ou_alice",
     parent_id: str | None = None,
     root_id: str | None = None,
+    thread_id: str | None = None,
 ):
     message = SimpleNamespace(
         message_id=message_id,
@@ -60,6 +61,7 @@ def _make_feishu_event(
         content=content,
         parent_id=parent_id,
         root_id=root_id,
+        thread_id=thread_id,
         mentions=[],
     )
     sender = SimpleNamespace(
@@ -93,6 +95,26 @@ def test_feishu_config_reply_to_message_defaults_false() -> None:
 def test_feishu_config_reply_to_message_can_be_enabled() -> None:
     config = FeishuConfig(reply_to_message=True)
     assert config.reply_to_message is True
+
+
+# ---------------------------------------------------------------------------
+# Thread-scoped session key tests
+# ---------------------------------------------------------------------------
+
+def test_derive_thread_session_key_uses_thread_id_for_group_topics() -> None:
+    assert (
+        FeishuChannel._derive_thread_session_key("oc_group", "group", "omt_topic", "om_root")
+        == "feishu:oc_group:thread:omt_topic"
+    )
+
+
+def test_derive_thread_session_key_requires_thread_id() -> None:
+    assert FeishuChannel._derive_thread_session_key("oc_group", "group", None, "om_root") is None
+
+
+def test_derive_thread_session_key_ignores_dm_and_plain_group_messages() -> None:
+    assert FeishuChannel._derive_thread_session_key("oc_group", "group", None, None) is None
+    assert FeishuChannel._derive_thread_session_key("oc_group", "p2p", "omt_topic", "om_root") is None
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +342,25 @@ async def test_send_skips_reply_for_progress_messages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_uses_root_id_for_topic_reply_when_thread_id_missing() -> None:
+    channel = _make_feishu_channel(reply_to_message=False)
+
+    reply_resp = MagicMock()
+    reply_resp.success.return_value = True
+    channel._client.im.v1.message.reply.return_value = reply_resp
+
+    await channel.send(OutboundMessage(
+        channel="feishu",
+        chat_id="oc_abc",
+        content="hello topic",
+        metadata={"message_id": "om_001", "root_id": "om_root"},
+    ))
+
+    channel._client.im.v1.message.reply.assert_called_once()
+    channel._client.im.v1.message.create.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_fallback_to_create_when_reply_fails() -> None:
     channel = _make_feishu_channel(reply_to_message=True)
 
@@ -376,6 +417,84 @@ async def test_on_message_captures_parent_and_root_id_in_metadata() -> None:
     assert meta["parent_id"] == "om_parent"
     assert meta["root_id"] == "om_root"
     assert meta["message_id"] == "om_001"
+
+
+@pytest.mark.asyncio
+async def test_on_message_uses_thread_session_key_for_group_topic() -> None:
+    channel = _make_feishu_channel()
+    channel.config.group_policy = "open"
+    channel._processed_message_ids.clear()
+
+    captured = []
+
+    async def _capture(**kwargs):
+        captured.append(kwargs)
+
+    channel._handle_message = _capture
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(
+            _make_feishu_event(
+                chat_type="group",
+                root_id="om_root",
+                thread_id="omt_topic",
+            )
+        )
+
+    assert len(captured) == 1
+    assert captured[0]["chat_id"] == "oc_abc"
+    assert captured[0]["session_key"] == "feishu:oc_abc:thread:omt_topic"
+
+
+@pytest.mark.asyncio
+async def test_on_message_keeps_group_session_for_reply_chain_without_thread_id() -> None:
+    channel = _make_feishu_channel()
+    channel.config.group_policy = "open"
+    channel._processed_message_ids.clear()
+
+    captured = []
+
+    async def _capture(**kwargs):
+        captured.append(kwargs)
+
+    channel._handle_message = _capture
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(
+            _make_feishu_event(
+                chat_type="group",
+                parent_id="om_parent",
+                root_id="om_root",
+                thread_id=None,
+            )
+        )
+
+    assert len(captured) == 1
+    assert captured[0]["chat_id"] == "oc_abc"
+    assert captured[0]["metadata"]["parent_id"] == "om_parent"
+    assert captured[0]["metadata"]["root_id"] == "om_root"
+    assert captured[0]["session_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_on_message_keeps_group_session_for_plain_group_message() -> None:
+    channel = _make_feishu_channel()
+    channel.config.group_policy = "open"
+    channel._processed_message_ids.clear()
+
+    captured = []
+
+    async def _capture(**kwargs):
+        captured.append(kwargs)
+
+    channel._handle_message = _capture
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(_make_feishu_event(chat_type="group"))
+
+    assert len(captured) == 1
+    assert captured[0]["chat_id"] == "oc_abc"
+    assert captured[0]["session_key"] is None
 
 
 @pytest.mark.asyncio

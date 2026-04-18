@@ -514,6 +514,31 @@ class FeishuChannel(BaseChannel):
             return True
         return self._is_bot_mentioned(message)
 
+    @staticmethod
+    def _derive_thread_session_key(
+        chat_id: str, chat_type: str | None, thread_id: str | None, root_id: str | None
+    ) -> str | None:
+        """Use one nanobot session per Feishu group topic/thread."""
+        if chat_type != "group":
+            return None
+        if not thread_id:
+            return None
+        return f"feishu:{chat_id}:thread:{thread_id}"
+
+    @staticmethod
+    def _stream_buffer_key(chat_id: str, metadata: dict[str, Any]) -> str:
+        """Keep simultaneous group-topic streams from sharing one card buffer."""
+        topic_id = metadata.get("thread_id") or metadata.get("root_id")
+        return f"{chat_id}:thread:{topic_id}" if topic_id else chat_id
+
+    def _reply_message_id_from_metadata(self, metadata: dict[str, Any]) -> str | None:
+        """Return the message id to reply to for quote/topic routing."""
+        if self.config.reply_to_message and not metadata.get("_progress", False):
+            return metadata.get("message_id") or None
+        if metadata.get("thread_id") or metadata.get("root_id"):
+            return metadata.get("root_id") or metadata.get("message_id") or None
+        return None
+
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
         """Sync helper for adding reaction (runs in thread pool)."""
         from lark_oapi.api.im.v1 import (
@@ -1166,7 +1191,12 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return None
 
-    def _create_streaming_card_sync(self, receive_id_type: str, chat_id: str) -> str | None:
+    def _create_streaming_card_sync(
+        self,
+        receive_id_type: str,
+        chat_id: str,
+        reply_message_id: str | None = None,
+    ) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id."""
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
@@ -1196,13 +1226,12 @@ class FeishuChannel(BaseChannel):
                 return None
             card_id = getattr(response.data, "card_id", None)
             if card_id:
-                message_id = self._send_message_sync(
-                    receive_id_type,
-                    chat_id,
-                    "interactive",
-                    json.dumps({"type": "card", "data": {"card_id": card_id}}),
-                )
-                if message_id:
+                card_ref = json.dumps({"type": "card", "data": {"card_id": card_id}})
+                if reply_message_id and self._reply_message_sync(
+                    reply_message_id, "interactive", card_ref
+                ):
+                    return card_id
+                if self._send_message_sync(receive_id_type, chat_id, "interactive", card_ref):
                     return card_id
                 logger.warning(
                     "Created streaming card {} but failed to send it to {}", card_id, chat_id
@@ -1297,6 +1326,7 @@ class FeishuChannel(BaseChannel):
         if not self._client:
             return
         meta = metadata or {}
+        stream_key = self._stream_buffer_key(chat_id, meta)
         loop = asyncio.get_running_loop()
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
 
@@ -1308,7 +1338,7 @@ class FeishuChannel(BaseChannel):
                 if self.config.done_emoji and message_id:
                     await self._add_reaction(message_id, self.config.done_emoji)
 
-            buf = self._stream_bufs.pop(chat_id, None)
+            buf = self._stream_bufs.pop(stream_key, None)
             if not buf or not buf.text:
                 return
             # Try to finalize via streaming card; if that fails (e.g.
@@ -1343,16 +1373,25 @@ class FeishuChannel(BaseChannel):
                     {"config": {"wide_screen_mode": True}, "elements": chunk},
                     ensure_ascii=False,
                 )
-                await loop.run_in_executor(
-                    None, self._send_message_sync, rid_type, chat_id, "interactive", card
-                )
+                reply_message_id = self._reply_message_id_from_metadata(meta)
+                if reply_message_id:
+                    ok = await loop.run_in_executor(
+                        None,
+                        self._reply_message_sync,
+                        reply_message_id,
+                        "interactive",
+                        card,
+                    )
+                    if ok:
+                        continue
+                await loop.run_in_executor(None, self._send_message_sync, rid_type, chat_id, "interactive", card)
             return
 
         # --- accumulate delta ---
-        buf = self._stream_bufs.get(chat_id)
+        buf = self._stream_bufs.get(stream_key)
         if buf is None:
             buf = _FeishuStreamBuf()
-            self._stream_bufs[chat_id] = buf
+            self._stream_bufs[stream_key] = buf
         buf.text += delta
         if not buf.text.strip():
             return
@@ -1360,7 +1399,11 @@ class FeishuChannel(BaseChannel):
         now = time.monotonic()
         if buf.card_id is None:
             card_id = await loop.run_in_executor(
-                None, self._create_streaming_card_sync, rid_type, chat_id
+                None,
+                self._create_streaming_card_sync,
+                rid_type,
+                chat_id,
+                self._reply_message_id_from_metadata(meta),
             )
             if card_id:
                 buf.card_id = card_id
@@ -1393,13 +1436,14 @@ class FeishuChannel(BaseChannel):
                 hint = (msg.content or "").strip()
                 if not hint:
                     return
-                buf = self._stream_bufs.get(msg.chat_id)
+                buf = self._stream_bufs.get(self._stream_buffer_key(msg.chat_id, msg.metadata))
                 if buf and buf.card_id:
                     # Delegate to send_delta so tool hints get the same
                     # throttling (and card creation) as regular text deltas.
                     await self.send_delta(
                         msg.chat_id,
                         "\n\n" + self._format_tool_hint_delta(hint) + "\n\n",
+                        metadata=msg.metadata,
                     )
                     return
                 # No active streaming card — send as a regular
@@ -1418,14 +1462,8 @@ class FeishuChannel(BaseChannel):
             # Determine whether the first message should quote the user's message.
             # Only the very first send (media or text) in this call uses reply; subsequent
             # chunks/media fall back to plain create to avoid redundant quote bubbles.
-            reply_message_id: str | None = None
-            if self.config.reply_to_message and not msg.metadata.get("_progress", False):
-                reply_message_id = msg.metadata.get("message_id") or None
-            # For topic group messages, always reply to keep context in thread
-            elif msg.metadata.get("thread_id"):
-                reply_message_id = (
-                    msg.metadata.get("root_id") or msg.metadata.get("message_id") or None
-                )
+            # For topic group messages, always reply to keep context in thread.
+            reply_message_id = self._reply_message_id_from_metadata(msg.metadata)
 
             first_send = True  # tracks whether the reply has already been used
 
@@ -1434,7 +1472,11 @@ class FeishuChannel(BaseChannel):
                 nonlocal first_send
                 if reply_message_id and first_send:
                     first_send = False
-                    ok = self._reply_message_sync(reply_message_id, m_type, content)
+                    ok = self._reply_message_sync(
+                        reply_message_id,
+                        m_type,
+                        content,
+                    )
                     if ok:
                         return
                     # Fall back to regular send if reply fails
@@ -1626,6 +1668,9 @@ class FeishuChannel(BaseChannel):
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            session_key = self._derive_thread_session_key(
+                chat_id, chat_type, thread_id, root_id
+            )
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -1640,6 +1685,7 @@ class FeishuChannel(BaseChannel):
                     "root_id": root_id,
                     "thread_id": thread_id,
                 },
+                session_key=session_key,
             )
 
         except Exception as e:
