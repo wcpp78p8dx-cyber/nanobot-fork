@@ -4,6 +4,8 @@ This file records local fork changes and day-to-day commands that are easy to fo
 
 ## OpenAI Codex OAuth Account Pool
 
+Added: 2026-04-16
+
 This fork stores Codex OAuth credentials explicitly under the active nanobot config directory instead of using `oauth-cli-kit`'s global default path or importing `~/.codex/auth.json`.
 
 Default token pool path:
@@ -41,6 +43,8 @@ Runtime behavior:
 When a Codex request hits a 429/rate-limit error, nanobot puts the current profile into cooldown and automatically retries with the next available Codex profile. Successful requests update `last_used`, so available accounts rotate in least-recently-used order.
 
 ## Feishu Group Topic Sessions
+
+Added: 2026-04-18
 
 This fork keeps Feishu group topics isolated from the main group chat session. A group message with a real Feishu `thread_id` uses a session key like:
 
