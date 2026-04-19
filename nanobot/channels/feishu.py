@@ -518,8 +518,8 @@ class FeishuChannel(BaseChannel):
     def _derive_thread_session_key(
         chat_id: str, chat_type: str | None, thread_id: str | None, root_id: str | None
     ) -> str | None:
-        """Use one nanobot session per Feishu group topic/thread."""
-        if chat_type != "group":
+        """Use one nanobot session per Feishu topic/thread when Feishu provides an ID."""
+        if chat_type not in {"group", "p2p"}:
             return None
         if not thread_id:
             return None
@@ -534,6 +534,8 @@ class FeishuChannel(BaseChannel):
     def _reply_message_id_from_metadata(self, metadata: dict[str, Any]) -> str | None:
         """Return the message id to reply to for quote/topic routing."""
         if self.config.reply_to_message and not metadata.get("_progress", False):
+            return metadata.get("message_id") or None
+        if metadata.get("reply_in_thread") and not metadata.get("_progress", False):
             return metadata.get("message_id") or None
         if metadata.get("thread_id") or metadata.get("root_id"):
             return metadata.get("root_id") or metadata.get("message_id") or None
@@ -1126,17 +1128,29 @@ class FeishuChannel(BaseChannel):
             logger.debug("Feishu: error fetching parent message {}: {}", message_id, e)
             return None
 
-    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> bool:
+    def _reply_message_sync(
+        self,
+        parent_message_id: str,
+        msg_type: str,
+        content: str,
+        *,
+        reply_in_thread: bool = False,
+    ) -> bool:
         """Reply to an existing Feishu message using the Reply API (synchronous)."""
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
         try:
+            body_builder = (
+                ReplyMessageRequestBody.builder()
+                .msg_type(msg_type)
+                .content(content)
+            )
+            if reply_in_thread:
+                body_builder = body_builder.reply_in_thread(True)
             request = (
                 ReplyMessageRequest.builder()
                 .message_id(parent_message_id)
-                .request_body(
-                    ReplyMessageRequestBody.builder().msg_type(msg_type).content(content).build()
-                )
+                .request_body(body_builder.build())
                 .build()
             )
             response = self._client.im.v1.message.reply(request)
@@ -1476,6 +1490,7 @@ class FeishuChannel(BaseChannel):
                         reply_message_id,
                         m_type,
                         content,
+                        reply_in_thread=bool(msg.metadata.get("reply_in_thread")),
                     )
                     if ok:
                         return
@@ -1669,7 +1684,7 @@ class FeishuChannel(BaseChannel):
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
             session_key = self._derive_thread_session_key(
-                chat_id, chat_type, thread_id, root_id
+                reply_to, chat_type, thread_id, root_id
             )
             await self._handle_message(
                 sender_id=sender_id,

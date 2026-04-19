@@ -108,13 +108,20 @@ def test_derive_thread_session_key_uses_thread_id_for_group_topics() -> None:
     )
 
 
+def test_derive_thread_session_key_uses_thread_id_for_dm_topics() -> None:
+    assert (
+        FeishuChannel._derive_thread_session_key("ou_alice", "p2p", "omt_topic", "om_root")
+        == "feishu:ou_alice:thread:omt_topic"
+    )
+
+
 def test_derive_thread_session_key_requires_thread_id() -> None:
     assert FeishuChannel._derive_thread_session_key("oc_group", "group", None, "om_root") is None
 
 
-def test_derive_thread_session_key_ignores_dm_and_plain_group_messages() -> None:
+def test_derive_thread_session_key_ignores_plain_messages() -> None:
     assert FeishuChannel._derive_thread_session_key("oc_group", "group", None, None) is None
-    assert FeishuChannel._derive_thread_session_key("oc_group", "p2p", "omt_topic", "om_root") is None
+    assert FeishuChannel._derive_thread_session_key("ou_alice", "p2p", None, None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +201,24 @@ def test_reply_message_sync_returns_true_on_success() -> None:
 
     assert ok is True
     channel._client.im.v1.message.reply.assert_called_once()
+
+
+def test_reply_message_sync_can_request_thread_reply() -> None:
+    channel = _make_feishu_channel()
+    resp = MagicMock()
+    resp.success.return_value = True
+    channel._client.im.v1.message.reply.return_value = resp
+
+    ok = channel._reply_message_sync(
+        "om_parent",
+        "text",
+        '{"text":"hi"}',
+        reply_in_thread=True,
+    )
+
+    assert ok is True
+    request = channel._client.im.v1.message.reply.call_args.args[0]
+    assert request.body.reply_in_thread is True
 
 
 def test_reply_message_sync_returns_false_on_api_error() -> None:
@@ -361,6 +386,27 @@ async def test_send_uses_root_id_for_topic_reply_when_thread_id_missing() -> Non
 
 
 @pytest.mark.asyncio
+async def test_send_can_request_reply_in_thread_without_global_reply_setting() -> None:
+    channel = _make_feishu_channel(reply_to_message=False)
+
+    reply_resp = MagicMock()
+    reply_resp.success.return_value = True
+    channel._client.im.v1.message.reply.return_value = reply_resp
+
+    await channel.send(OutboundMessage(
+        channel="feishu",
+        chat_id="ou_alice",
+        content="hello topic",
+        metadata={"message_id": "om_001", "reply_in_thread": True},
+    ))
+
+    channel._client.im.v1.message.reply.assert_called_once()
+    request = channel._client.im.v1.message.reply.call_args.args[0]
+    assert request.body.reply_in_thread is True
+    channel._client.im.v1.message.create.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_fallback_to_create_when_reply_fails() -> None:
     channel = _make_feishu_channel(reply_to_message=True)
 
@@ -444,6 +490,34 @@ async def test_on_message_uses_thread_session_key_for_group_topic() -> None:
     assert len(captured) == 1
     assert captured[0]["chat_id"] == "oc_abc"
     assert captured[0]["session_key"] == "feishu:oc_abc:thread:omt_topic"
+
+
+@pytest.mark.asyncio
+async def test_on_message_uses_thread_session_key_for_dm_topic() -> None:
+    channel = _make_feishu_channel()
+    channel._processed_message_ids.clear()
+
+    captured = []
+
+    async def _capture(**kwargs):
+        captured.append(kwargs)
+
+    channel._handle_message = _capture
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(
+            _make_feishu_event(
+                chat_type="p2p",
+                chat_id="oc_p2p",
+                sender_open_id="ou_alice",
+                root_id="om_root",
+                thread_id="omt_topic",
+            )
+        )
+
+    assert len(captured) == 1
+    assert captured[0]["chat_id"] == "ou_alice"
+    assert captured[0]["session_key"] == "feishu:ou_alice:thread:omt_topic"
 
 
 @pytest.mark.asyncio

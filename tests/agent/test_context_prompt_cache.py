@@ -205,6 +205,38 @@ def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
     assert "messaging app" in system
 
 
+def test_thread_session_messages_still_get_system_context(tmp_path) -> None:
+    """Thread-scoped sessions are storage keys only; prompt context is still injected."""
+    workspace = _make_workspace(tmp_path)
+    from nanobot.utils.helpers import sync_workspace_templates
+    sync_workspace_templates(workspace, silent=True)
+
+    (workspace / "AGENTS.md").write_text("Use the local agent identity.", encoding="utf-8")
+    (workspace / "SOUL.md").write_text("You are Nanobot with a warm voice.", encoding="utf-8")
+    (workspace / "USER.md").write_text("The user prefers concise Chinese replies.", encoding="utf-8")
+    (workspace / "memory" / "MEMORY.md").write_text(
+        "# Long-term Memory\n\nUser likes Feishu topic workflows.\n",
+        encoding="utf-8",
+    )
+
+    builder = ContextBuilder(workspace)
+    messages = builder.build_messages(
+        history=[],
+        current_message="thread follow-up",
+        channel="feishu",
+        chat_id="ou_alice:thread:omt_topic",
+    )
+
+    assert messages[0]["role"] == "system"
+    system = messages[0]["content"]
+    assert "Use the local agent identity." in system
+    assert "You are Nanobot with a warm voice." in system
+    assert "The user prefers concise Chinese replies." in system
+    assert "User likes Feishu topic workflows." in system
+    assert messages[-1]["role"] == "user"
+    assert "Chat ID: ou_alice:thread:omt_topic" in messages[-1]["content"]
+
+
 def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)

@@ -3,7 +3,12 @@
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    ArraySchema,
+    BooleanSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.bus.events import OutboundMessage
 
 
@@ -15,6 +20,13 @@ from nanobot.bus.events import OutboundMessage
         media=ArraySchema(
             StringSchema(""),
             description="Optional: list of file paths to attach (images, audio, documents)",
+        ),
+        reply_in_thread=BooleanSchema(
+            description=(
+                "Optional Feishu/Lark only: when replying to the current message, "
+                "ask Feishu to reply in thread/topic form."
+            ),
+            default=False,
         ),
         required=["content"],
     )
@@ -69,6 +81,7 @@ class MessageTool(Tool):
         chat_id: str | None = None,
         message_id: str | None = None,
         media: list[str] | None = None,
+        reply_in_thread: bool = False,
         **kwargs: Any
     ) -> str:
         from nanobot.utils.helpers import strip_think
@@ -92,14 +105,18 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        metadata: dict[str, Any] = {}
+        if message_id:
+            metadata["message_id"] = message_id
+        if reply_in_thread:
+            metadata["reply_in_thread"] = True
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
             media=media or [],
-            metadata={
-                "message_id": message_id,
-            } if message_id else {},
+            metadata=metadata,
         )
 
         try:
